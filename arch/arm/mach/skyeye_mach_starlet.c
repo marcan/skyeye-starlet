@@ -1920,6 +1920,24 @@ static void starlet_sdhc_exec(ARMul_State *state)
 		starlet_sdhc_fire_irq(state, SDHC_TRANSFER_COMPLETE);
 		goto done;
 	}
+	if (command == 25) {
+		DEBUG("      -> WRITE_MULTIPLE 0x%x %04x %d -> %08x\n",
+			  io.sdhc_reg.argument, io.sdhc_reg.blk_size, io.sdhc_reg.blk_cnt,
+			  io.sdhc_reg.dma_addr);
+		int block_size = io.sdhc_reg.blk_size & 0xfff;
+		void *buf = malloc(block_size * io.sdhc_reg.blk_cnt);
+		starlet_arm2host(state, buf, io.sdhc_reg.dma_addr, block_size * io.sdhc_reg.blk_cnt);
+		fseek(sd, io.sdhc_reg.argument * 512L, SEEK_SET);
+		if (fwrite(buf, block_size, io.sdhc_reg.blk_cnt, sd) != io.sdhc_reg.blk_cnt) {
+			DEBUG("SDHC: Failed to write to SD file!\n");
+		}
+		//starlet_hexdump(buf, 512);
+		free(buf);
+		//starlet_emu_hexdump(state, io.sdhc_reg.dma_addr, 512);
+		starlet_sdhc_fire_irq(state, SDHC_COMMAND_COMPLETE);
+		starlet_sdhc_fire_irq(state, SDHC_TRANSFER_COMPLETE);
+		goto done;
+	}
 
 unimplemented:
 	starlet_sdhc_fire_irq(state, SDHC_COMMAND_COMPLETE);
