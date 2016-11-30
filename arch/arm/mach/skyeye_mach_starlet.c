@@ -49,6 +49,8 @@
 
 #define STARLET_DEBUG			1
 
+#define IPC_DOLPHIN
+
 #define PRINT(x...)			printf("[STARLET]: " x)
 
 #if STARLET_DEBUG
@@ -59,6 +61,7 @@
 #define SOMETIMES_DIVISOR (500000)
 
 static void starlet_print_context(ARMul_State *state);
+static int sendall(int s, void *buf, int len);
 
 char ascii(char s) {
 	if(s < 0x20) return '.';
@@ -149,6 +152,7 @@ struct starlet_io_t {
 	
 	ARMword ipc_ppcmsg, ipc_ppcctrl;
 	ARMword ipc_armmsg, ipc_armctrl;
+	int ipc_socket;
 	
 	struct {
 		ARMword csr;
@@ -1073,6 +1077,9 @@ static void starlet_gpio1_owner_write(ARMul_State *state, ARMword data) {
 
 static void starlet_ipc_write(ARMul_State *state, ARMword addr, ARMword data)
 {
+#ifdef IPC_DOLPHIN
+	u32 msg[2];
+#endif
 	switch(addr) {
 		case 0:
 			//DEBUG("PPC IPC MSG write: %08x\n", data);
@@ -1096,6 +1103,11 @@ static void starlet_ipc_write(ARMul_State *state, ARMword addr, ARMword data)
 		case 8:
 			//DEBUG("ARM IPC MSG write: %08x\n", data);
 			io.ipc_armmsg = data;
+#ifdef IPC_DOLPHIN
+			msg[0] = addr;
+			msg[1] = data;
+			sendall(io.ipc_socket, msg, 8);
+#endif
 			break;
 		case 12:
 			//DEBUG("ARM IPC CTRL write: %08x\n", data);
@@ -1111,6 +1123,13 @@ static void starlet_ipc_write(ARMul_State *state, ARMword addr, ARMword data)
 				io.ipc_ppcctrl &= ~0x08;
 			if(data & 0x04)
 				io.ipc_ppcctrl &= ~0x01;
+#ifdef IPC_DOLPHIN
+			if(data & 0x0f) {
+				msg[0] = addr;
+				msg[1] = data;
+				sendall(io.ipc_socket, msg, 8);
+			}
+#endif
 			break;
 	}
 }
@@ -2402,8 +2421,9 @@ enum ipc_state {
 };
 
 #define SOCK_PATH "ipcsock"
+#define DOLPHIN_SOCK_PATH "/tmp/dolphin_ipc"
 
-int sendall(int s, void *buf, int len)
+static int sendall(int s, void *buf, int len)
 {
 	int total = 0;        // how many bytes we've sent
 	int bytesleft = len; // how many we have left to send
@@ -2419,7 +2439,7 @@ int sendall(int s, void *buf, int len)
 	return n==-1?-1:0; // return -1 on failure, 0 on success
 }
 
-int recvall(int s, void *buf, int len)
+static int recvall(int s, void *buf, int len)
 {
 	int total = 0;        // how many bytes we've received
 	int bytesleft = len; // how many we have left to receive
@@ -2527,12 +2547,14 @@ struct cooked_state {
 	ARMword fsr, far;
 };
 
+#ifndef IPC_DOLPHIN
+
 static void starlet_do_ipc(ARMul_State *state)
 {
 	static enum ipc_state ipcs = IPC_INIT;
 	static int asock, bsock;
 	static struct sockaddr_un local, remote;
-	static int last_ppc_state = 0;
+	static int last_ppc_state = 1;
 	int len;
 	unsigned int t;
 	int res;
@@ -2713,19 +2735,84 @@ static void starlet_do_ipc(ARMul_State *state)
 	}
 }
 
+#else
+
+static void starlet_do_ipc_dolphin(ARMul_State *state)
+{
+	static struct sockaddr_un remote;
+	static int last_ppc_state = 1;
+	int len;
+	int res;
+	static int initialized = 0;
+	u32 msg[8];
+	
+	if (!initialized) {
+		starlet_ipc_write(state, 4, 0x06);
+		if ((io.ipc_socket = socket(AF_UNIX, SOCK_STREAM, 0)) == -1) {
+			perror("socket");
+			skyeye_exit(1);
+		}
+		remote.sun_family = AF_UNIX;
+		strcpy(remote.sun_path, DOLPHIN_SOCK_PATH);
+		len = strlen(remote.sun_path) + sizeof(remote.sun_family);
+		fcntl(io.ipc_socket, F_SETFL, O_NONBLOCK);
+		if (connect(io.ipc_socket, (struct sockaddr *)&remote, len) == -1) {
+			perror("connect");
+			skyeye_exit(1);
+		}
+		printf("IPC: connected to Dolphin\n");
+		initialized = 1;
+	}
+	res = msgpending(io.ipc_socket);
+	if(res == -1) {
+		perror("msgpending");
+		skyeye_exit(1);
+	}
+	if(res == 1) {
+		if(recvall(io.ipc_socket, msg, 8)) {
+			perror("recvmsg");
+			skyeye_exit(1);
+		}
+		starlet_ipc_write(state, msg[0], msg[1]);
+	}
+	if(io.ppc_running != last_ppc_state) {
+		printf("IPC: PPC state change %d->%d\n", last_ppc_state, io.ppc_running);
+		msg[0] = 0x10000;
+		msg[1] = io.ppc_running;
+		if(sendall(io.ipc_socket, msg, 8)) {
+			perror("semdmsg");
+			skyeye_exit(1);
+		}
+		last_ppc_state = io.ppc_running;
+	}
+}
+
+#endif
+
 static void starlet_io_do_cycle(ARMul_State *state)
 {
+	static int ipc_div = 0;
+	int i;
 //	printf("io cycle\n");
-	io.timer++;
-	if (io.timer == io.alarm) {
-		starlet_set_intr(0);
-		starlet_update_int(state);
-		//DEBUG("Timer IRQ\n");
+	for (i = 0; i < 10; i++) {
+		io.timer++;
+		if (io.timer == io.alarm) {
+			starlet_set_intr(0);
+			starlet_update_int(state);
+			//DEBUG("Timer IRQ\n");
+		}
 	}
 	//starlet_print_context(state);
 	ipc_update_int(state);
-	starlet_do_ipc(state);
-	ipc_update_int(state);
+	if (++ipc_div > 100) {
+#ifndef IPC_DOLPHIN
+		starlet_do_ipc(state);
+#else
+		starlet_do_ipc_dolphin(state);
+#endif
+		ipc_update_int(state);
+		ipc_div = 0;
+	}
 }
 
 
@@ -3539,6 +3626,5 @@ void starlet_mach_init(ARMul_State *state, machine_config_t *this_mach)
 
 	starlet_sdhc_init(state);
 	printf("Starlet Init\n");
-
 }
 
