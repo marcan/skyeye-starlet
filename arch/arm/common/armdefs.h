@@ -182,6 +182,7 @@ typedef struct mem_bank
 	void (*write_word) (ARMul_State * state, ARMword addr, ARMword data);
 	ARMword addr, len;
 	char filename[MAX_STR];
+	off_t mmap;
 	unsigned type;		//chy 2003-09-21: maybe io,ram,rom
 	ARMword dest;
 } mem_bank_t;

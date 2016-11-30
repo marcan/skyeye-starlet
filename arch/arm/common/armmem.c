@@ -34,9 +34,6 @@ mem_reset (ARMul_State * state)
 {
 	int i, num, bank;
 	FILE *f;
-	unsigned char *p;
-	int s;
-	ARMword swap;
 	mem_config_t *mc = state->mem_bank;
 	mem_bank_t *mb = mc->mem_banks;
 
@@ -85,7 +82,28 @@ mem_reset (ARMul_State * state)
 				//AJ2D--------------------------------------------------------------------------
 			}
 #endif
-			if (mb[bank].filename
+			if (mb[bank].filename && mb[bank].mmap != -1) {
+				int fd = open (mb[bank].filename, O_RDWR);
+				if (fd < 0) {
+					perror("open");
+					fprintf (stderr,
+						 "Failed to open '%s'\n",
+						 mb[bank].filename);
+					skyeye_exit (-1);
+				}
+				free(state->mem.rom[bank]);
+				state->mem.rom[bank] = mmap(NULL, mb[bank].len,
+											PROT_READ|PROT_WRITE,
+											MAP_SHARED, fd, mb[bank].mmap);
+				if (!state->mem.rom[bank]) {
+					fprintf (stderr,
+						"SKYEYE: mem_reset: Error mmaping mem for bank number %d.\n",
+						bank);
+					skyeye_exit (-1);
+				}
+				printf ("Mapped   %s (%08lx)\n", mb[bank].filename, mb[bank].mmap);
+			}
+			else if (mb[bank].filename
 			    && (f = fopen (mb[bank].filename, "rb"))) {
 				if (fread
 				    (state->mem.rom[bank], 1, mb[bank].len,
@@ -97,29 +115,6 @@ mem_reset (ARMul_State * state)
 					skyeye_exit (-1);
 				}
 				fclose (f);
-
-				p = (unsigned char *) state->mem.rom[bank];
-				s = 0;
-				while (s < state->mem.rom_size[bank]) {
-					if (state->bigendSig == HIGH)	/*big enddian? */
-						swap = ((ARMword) p[3]) |
-							(((ARMword) p[2]) <<
-							 8) | (((ARMword)
-								p[1]) << 16) |
-							(((ARMword) p[0]) <<
-							 24);
-					else
-						swap = ((ARMword) p[0]) |
-							(((ARMword) p[1]) <<
-							 8) | (((ARMword)
-								p[2]) << 16) |
-							(((ARMword) p[3]) <<
-							 24);
-					*(ARMword *) p = swap;
-					p += 4;
-					s += 4;
-				}
-
 				/*ywc 2004-03-30 */
 				//printf("Loaded ROM %s\n", mb[bank].filename);
 				if (mb[bank].type == MEMTYPE_FLASH) {
@@ -429,7 +424,7 @@ real_read_byte (ARMul_State * state, ARMword addr)
 							   global_mbp->
 							   addr) >> 2];
 
-	offset = (((ARMword) state->bigendSig * 3) ^ (addr & 3)) << 3;	/* bit offset into the word */
+	offset = (addr & 3) << 3;
 
 	return (data >> offset & 0xffL);
 }
@@ -452,9 +447,14 @@ real_read_halfword (ARMul_State * state, ARMword addr)
 							   global_mbp->
 							   addr) >> 2];
 
-	offset = (((ARMword) state->bigendSig * 2) ^ (addr & 2)) << 3;	/* bit offset into the word */
+	offset = (addr & 2) << 3;
 
-	return (data >> offset) & 0xffff;
+	data = (data >> offset) & 0xffff;
+
+	if (state->bigendSig == HIGH)
+		data = (data << 8) | (data >> 8);
+
+	return data & 0xffff;
 }
 
 ARMword
@@ -474,6 +474,9 @@ real_read_word (ARMul_State * state, ARMword addr)
 			      state->mem_bank->mem_banks][(addr -
 							   global_mbp->
 							   addr) >> 2];
+
+	if (state->bigendSig == HIGH)
+		data = (data << 24) | (data >> 24) | ((data & 0xff00) << 8) | ((data & 0xff0000) >> 8);
 	return data;
 }
 
@@ -500,25 +503,12 @@ real_write_byte (ARMul_State * state, ARMword addr, ARMword data)
 	}
 #endif
 
-	//temp = &state->mem.rom[mbp - skyeye_config.mem.mem_banks][(addr - mbp->addr) >> 2];
 	temp = &state->mem.rom[global_mbp -
 			       state->mem_bank->mem_banks][(addr -
 							    global_mbp->
 							    addr) >> 2];
-	offset = (((ARMword) state->bigendSig * 3) ^ (addr & 3)) << 3;	/* bit offset into the word */
-	//printf(stderr,"SKYEYE real_write_byte 1: temp %x,tempval %x,offset %x, addr %x, data %x\n",temp,*temp,offset,addr,data);
 
-	*temp = (*temp & ~(0xffL << offset)) | ((data & 0xffL) << offset);
-	//printf(stderr,"SKYEYE real_write_byte 2: temp %x,tempval %x,offset %x, addr %x, data %x\n",temp,*temp,offset,addr,data);
-	//chy 2004-03-11: add lcd test
-	//chy 2004-03-17 fix a bug: didn't test skyeye_config.no_lcd
-	//chy 2004-09-29 disable blow lines
-	/*
-	   if((!skyeye_config.no_lcd) && *(state->mach_io.lcd_is_enable) && addr >= *(state->mach_io.lcd_addr_begin) && addr <= *(state->mach_io.lcd_addr_end)){
-	   //fprintf(stderr, "SKYEYE,lcd enabled  write byte lcd memory addr %x, data %x\n",addr,*temp);
-	   skyeye_config.mach->mach_lcd_write(state,addr,*temp);
-	   }
-	 */
+	((u8*)temp)[addr & 3] = data;
 }
 
 void
@@ -544,14 +534,22 @@ real_write_halfword (ARMul_State * state, ARMword addr, ARMword data)
 	}
 #endif
 
+	data &= 0xffff;
+
+	if (state->bigendSig == HIGH) {
+		data = (data << 8) | (data >> 8);
+		data &= 0xffff;
+	}
+
 	//temp = &state->mem.rom[mbp - skyeye_config.mem.mem_banks][(addr - mbp->addr) >> 2];
 	temp = &state->mem.rom[global_mbp -
 			       state->mem_bank->mem_banks][(addr -
 							    global_mbp->
 							    addr) >> 2];
-	offset = (((ARMword) state->bigendSig * 2) ^ (addr & 2)) << 3;	/* bit offset into the word */
 
-	*temp = (*temp & ~(0xffffL << offset)) | ((data & 0xffffL) << offset);
+	//offset = (((ARMword) state->bigendSig * 2) ^ (addr & 2)) << 3;
+
+	((u16*)temp)[(addr & 2) >> 1] = data;
 	//chy 2004-03-11: add lcd test
 	//chy 2004-03-17 fix a bug: didn't test skyeye_config.no_lcd
 	//chy 2004-09-29 disable blow lines
@@ -585,6 +583,8 @@ real_write_word (ARMul_State * state, ARMword addr, ARMword data)
 	}
 #endif
 
+	if (state->bigendSig == HIGH)
+		data = (data << 24) | (data >> 24) | ((data & 0xff00) << 8) | ((data & 0xff0000) >> 8);
 	//state->mem.rom[mbp - skyeye_config.mem.mem_banks][(addr - mbp->addr) >> 2] = data;
 	state->mem.rom[global_mbp -
 		       state->mem_bank->mem_banks][(addr -

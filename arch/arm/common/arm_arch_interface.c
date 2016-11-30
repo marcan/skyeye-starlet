@@ -197,6 +197,7 @@ arm_parse_mem (int num_params, const char *params[])
 
 	num = mc->current_num - 1;	/*mem_banks should begin from 0. */
 	mb[num].filename[0] = '\0';
+	mb[num].mmap = -1;
 	for (i = 0; i < num_params; i++) {
 		if (split_param (params[i], name, value) < 0)
 			SKYEYE_ERR
@@ -275,6 +276,12 @@ arm_parse_mem (int num_params, const char *params[])
 		}
 		else if (!strncmp ("file", name, strlen (name))) {
 			strncpy (mb[num].filename, value, strlen (value) + 1);
+		}
+		else if (!strncmp ("mmap", name, strlen (name))) {
+			if (value[0] == '0' && value[1] == 'x')
+				mb[num].mmap = strtoul (value, NULL, 16);
+			else
+				mb[num].mmap = strtoul (value, NULL, 10);
 		}
 		else if (!strncmp ("boot", name, strlen (name))) {
 			/*this must be the last parameter. */
